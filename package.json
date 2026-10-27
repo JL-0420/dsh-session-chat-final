@@ -1,0 +1,46 @@
+{
+  "name": "dsh-session-chat-final",
+  "version": "1.6.0",
+  "description": "DSH 会话群聊插件：让多个已开启的会话彼此交流，工作区互相隔离，可随时加入群组或踢出成员，带可视化面板与每分钟频率限制。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "session",
+    "chat",
+    "group",
+    "会话",
+    "群聊"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "meta": {
+    "title": "会话群聊",
+    "description": "让多个 DSH 会话互相交流，工作区隔离，可随时加入或踢出成员；面板可调每分钟条数、可暂停。"
+  }
+}

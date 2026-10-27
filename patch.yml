@@ -1,0 +1,9 @@
+# npm / 市场安装后的自注册入口
+- insert:
+    - id: session-chat-final
+      name: dsh-session-chat-final
+      config:
+        defaultGroupName: 默认群组
+        commandPrefix: '@chat'
+        maxHistoryMessages: 50
+      disabled: false
