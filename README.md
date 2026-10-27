@@ -7,7 +7,7 @@
 设置 → 插件 → 添加插件：
 
 ```
-C:\Users\17833\Desktop\dsh插件研发\自我配置\dsh-session-chat-final
+https://github.com/JL-0420/dsh-session-chat-final
 ```
 
 **改动过代码必须卸载重装，并重启 DSH**（Host 与 Web 端都要重新加载）。
