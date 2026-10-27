@@ -336,6 +336,8 @@ window.__ModuleLoader__.load({
       const [nick, setNick] = useState('')
       const [draft, setDraft] = useState('')
       const [mentionOpen, setMentionOpen] = useState(false)
+      const [profileOpen, setProfileOpen] = useState(false)
+      const [mentionPicks, setMentionPicks] = useState([])
       const [memes, setMemes] = useState([]) // 已弃用，保留占位避免旧引用报错
       const [avatarList, setAvatarList] = useState([])
       const [avatarMap, setAvatarMap] = useState({})
@@ -396,6 +398,30 @@ window.__ModuleLoader__.load({
           if (pollRef.current) clearInterval(pollRef.current)
         }
       }, [refresh])
+
+      // 「正在输入」心跳：只有草稿里有字时才发，纯给面板显示用
+      // 注意只读 activeGroup（state），不能用后面定义的 group
+      useEffect(() => {
+        if (!activeGroup || !me || !draft.trim()) return undefined
+        const fire = () => {
+          try {
+            const url = new URL(API, window.location.origin)
+            url.searchParams.set('op', 'typing')
+            url.searchParams.set('session', me)
+            url.searchParams.set('group', activeGroup)
+            fetch(url.toString(), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            }).catch(() => {})
+          } catch {
+            /* 忽略 */
+          }
+        }
+        fire()
+        const id = setInterval(fire, 2500)
+        return () => clearInterval(id)
+      }, [activeGroup, me, draft])
 
       // 独立头像库：先拿列表，再按需拉图片（不依赖表情包插件）
       const loadAvatars = useCallback(async () => {
@@ -569,6 +595,8 @@ window.__ModuleLoader__.load({
       const meInfo = sessions.find((s) => s.id === me)
       const meName = (meInfo && meInfo.name) || ''
       const group = groups.find((g) => g.id === activeGroup) || null
+      // 当前用户在这个群里的成员对象（两处 head 都要用）
+      const meMember = group ? group.members.find((m) => m.id === me) || null : null
 
       /** 成员头像：手动指定的优先，其次按 seed 从库里取；都没有返回空（Avatar 退回首字） */
       const avatarUrlFor = (member) => {
@@ -583,7 +611,7 @@ window.__ModuleLoader__.load({
 
       const memberById = (id) => (group ? group.members.find((x) => x.id === id) : undefined)
 
-      const isMine = (g) => !!g && !!me && g.ownerId === me
+      const isMine = (g) => !!g && !!me && (g.ownerId === me || me === HOST_ID)
       const amMember = (g) => !!g && !!me && g.members.some((m) => m.id === me)
 
       useEffect(() => {
@@ -595,8 +623,28 @@ window.__ModuleLoader__.load({
         const text = draft.trim()
         if (!text || !group) return
         if (me !== HOST_ID && !amMember(group)) return
+        const picks = mentionPicks.slice()
         setDraft('')
-        await run('send', { group: group.id, text })
+        setMentionPicks([])
+        await run('send', { group: group.id, text, mentions: picks })
+      }
+
+      /** 戳一戳：单独叫醒某个成员一次，不带上下文 */
+      const pokeMember = async (member) => {
+        if (!member || !group) return
+        if (member.id === me) {
+          setFlash('不能戳自己')
+          return
+        }
+        await run('poke', { group: group.id, target: member.id })
+      }
+
+      /** 把某个成员插进 @ 并记下 id（不靠名字，改名重名都不会错） */
+      const pickMention = (member) => {
+        if (!member) return
+        setDraft((d) => (d && !/\s$/.test(d) ? d + ' ' : d || '') + '@' + member.name + ' ')
+        setMentionPicks((prev) => (prev.includes(member.id) ? prev : prev.concat(member.id)))
+        setMentionOpen(false)
       }
 
       const changeRate = (d) => run('set_rate', { value: Math.max(1, Math.min(120, rate.perMinute + d)) })
@@ -790,7 +838,9 @@ window.__ModuleLoader__.load({
             { key: 'l' },
             group.members.map((m) =>
               h('div', { key: m.id, style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' } }, [
-                h(Avatar, { key: 'a', name: m.name, url: avatarUrlFor(m), size: 20 }),
+                h('span', { key: 'avw', style: { display: 'flex', cursor: 'pointer' }, title: '戳一戳', onClick: () => pokeMember(m) },
+                  h(Avatar, { key: 'a', name: m.name, url: avatarUrlFor(m), size: 20 }),
+                ),
                 h(
                   'button',
                   {
@@ -808,10 +858,7 @@ window.__ModuleLoader__.load({
                       padding: 0,
                       fontFamily: 'inherit',
                     },
-                    onClick: () => {
-                      setDraft((d) => (d && !/\s$/.test(d) ? d + ' ' : d || '') + '@' + m.name + ' ')
-                      setRosterOpen(false)
-                    },
+                    onClick: () => { pickMention(m); setRosterOpen(false) },
                   },
                   m.name + (m.id === me ? '（我）' : ''),
                 ),
@@ -1034,7 +1081,14 @@ window.__ModuleLoader__.load({
               },
             },
             [
-              h(Avatar, { key: 'av', name: senderLabel, url: avatarUrl, size: 32 }),
+              h('span', {
+                  key: 'av',
+                  style: { display: 'flex', cursor: sender ? 'pointer' : 'default' },
+                  title: sender ? '戳一戳 ' + senderLabel : senderLabel,
+                  onClick: sender ? () => pokeMember(sender) : undefined,
+                },
+                h(Avatar, { name: senderLabel, url: avatarUrl, size: 32 }),
+              ),
               h(
                 'div',
                 {
@@ -1061,10 +1115,115 @@ window.__ModuleLoader__.load({
                 h('div', { key: 'a' }, '这个群还没有消息'),
                 h('div', { key: 'b', style: { fontSize: 12 } }, member ? '从下面发第一条' : '先点右上「加入群组」'),
               ])
-            : msgs
+            : msgs.concat([
+                // 「某某正在输入…」——只给看面板的人看，不投递给任何会话
+                (group.typing || []).filter((t) => t.id !== me).length > 0
+                  ? h(
+                      'div',
+                      {
+                        key: 'typing',
+                        style: {
+                          fontSize: 12,
+                          color: 'var(--dsw-alias-label-secondary)',
+                          padding: '2px 4px 6px',
+                          fontStyle: 'italic',
+                        },
+                      },
+                      (group.typing || [])
+                        .filter((t) => t.id !== me)
+                        .map((t) => t.name)
+                        .join('、') + ' 正在输入…',
+                    )
+                  : null,
+              ])
 
         right = h('div', { style: S.main }, [
           head,
+          profileOpen && group && member
+            ? h('div', { key: 'profile', style: { padding: '0 16px' } }, [
+                h(
+                  'div',
+                  { key: 't', style: Object.assign({}, S.meta, { marginBottom: 6 }) },
+                  '我的资料 · 头像只能从头像库里选',
+                ),
+                h(
+                  'div',
+                  { key: 'avs', style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 } },
+                  (Array.isArray(avatarList) ? avatarList : []).slice(0, 24).map((item) =>
+                    h(
+                      'button',
+                      {
+                        key: item.id,
+                        type: 'button',
+                        title: item.name,
+                        style: {
+                          width: 36,
+                          height: 36,
+                          padding: 0,
+                          cursor: 'pointer',
+                          border:
+                            member.avatarName === item.id
+                              ? '2px solid var(--dsw-alias-brand-primary)'
+                              : '2px solid var(--dsw-alias-border-l1)',
+                          borderRadius: 8,
+                          overflow: 'hidden',
+                          background: 'var(--dsw-alias-bg-layer-2)',
+                        },
+                        onClick: () => setMyAvatar(item.id),
+                      },
+                      avatarMap[item.id]
+                        ? h('img', {
+                            src: avatarMap[item.id],
+                            alt: item.name,
+                            style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
+                          })
+                        : h('span', { style: { fontSize: 10 } }, '…'),
+                    ),
+                  ),
+                ),
+                (Array.isArray(avatarList) ? avatarList.length : 0) === 0
+                  ? h(
+                      'div',
+                      { key: 'empty', style: Object.assign({}, S.meta, { marginBottom: 6 }) },
+                      '头像库还是空的：先把图片丢进 ' + (avatarDir || 'avatars 目录') + '，或点右边「导入」',
+                    )
+                  : null,
+                h('div', { key: 'n', style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } }, [
+                  h('input', {
+                    key: 'i',
+                    style: Object.assign({}, S.input, { flex: '1 1 120px', padding: '5px 8px' }),
+                    placeholder: '昵称',
+                    value: nick,
+                    onChange: (e) => setNick(e.target.value),
+                    onKeyDown: (e) => {
+                      if (e.key === 'Enter' && nick.trim()) {
+                        run('identity', { name: nick.trim() }).then(() => setNick(''))
+                      }
+                    },
+                  }),
+                  h(
+                    'button',
+                    {
+                      key: 's',
+                      type: 'button',
+                      style: S.btnPrimary,
+                      disabled: !nick.trim(),
+                      onClick: () => {
+                        if (!nick.trim()) return
+                        run('identity', { name: nick.trim() }).then(() => setNick(''))
+                      },
+                    },
+                    '保存',
+                  ),
+                  h(
+                    'button',
+                    { key: 'u', type: 'button', style: S.btn, onClick: () => fileRef.current && fileRef.current.click() },
+                    '导入',
+                  ),
+                  h('button', { key: 'c', type: 'button', style: S.btn, onClick: () => setProfileOpen(false) }, '关闭'),
+                ]),
+              ])
+            : null,
           rosterOpen ? h('div', { key: 'roster', style: { padding: '0 16px' } }, roster) : null,
           inviteOpen ? h('div', { key: 'invite', style: { padding: '0 16px' } }, invite) : null,
           flash ? h('div', { key: 'flash', style: S.flash }, flash) : null,
@@ -1127,10 +1286,7 @@ window.__ModuleLoader__.load({
                             onMouseLeave: (e) => {
                               e.currentTarget.style.background = 'transparent'
                             },
-                            onClick: () => {
-                              setDraft((d) => (d && !/\s$/.test(d) ? d + ' ' : d || '') + '@' + m.name + ' ')
-                              setMentionOpen(false)
-                            },
+                            onClick: () => pickMention(m),
                           },
                           h(Avatar, { key: 'a', name: m.name, url: avatarUrlFor(m), size: 22 }),
                           h('span', { key: 'n', style: { flex: 1 } }, m.name),
@@ -1175,6 +1331,28 @@ window.__ModuleLoader__.load({
                 }
               },
             }),
+            // 强制全员：跳过 AI 路由，直接叫醒所有成员
+            h(
+              'button',
+              {
+                key: 'force',
+                type: 'button',
+                title: '强制全员（跳过 AI 路由判断）',
+                style: Object.assign({}, S.btn, {
+                  opacity: canSpeak && draft.trim() ? 1 : 0.45,
+                }),
+                disabled: !canSpeak || !draft.trim(),
+                onClick: () => {
+                  const text = draft.trim()
+                  if (!text || !group) return
+                  const picks = mentionPicks.slice()
+                  setDraft('')
+                  setMentionPicks([])
+                  run('send', { group: group.id, text, force: true, mentions: picks })
+                },
+              },
+              '⚡全员',
+            ),
             h(
               'button',
               {
@@ -1320,6 +1498,47 @@ window.__ModuleLoader__.load({
             )
           : null,
         h('div', {
+          key: 'divider-eg',
+          style: { borderTop: '1px solid var(--dsw-alias-border-l1)', margin: '10px 0' },
+        }),
+        h(
+          'div',
+          { key: 'eg-t', style: Object.assign({}, S.meta, { marginBottom: 4 }) },
+          '回复意愿（影响投递给 AI 的提示措辞）',
+        ),
+        h(
+          'div',
+          { key: 'eg-r', style: { display: 'flex', gap: 6, marginBottom: 4 } },
+          [
+            ['cautious', '克制'],
+            ['balanced', '平衡'],
+            ['active', '活跃'],
+          ].map(([key, label]) => {
+            const on = ((state && state.eagerness) || 'balanced') === key
+            return h(
+              'button',
+              {
+                key,
+                type: 'button',
+                style: Object.assign({}, S.btn, on
+                  ? {
+                      borderColor: 'var(--dsw-alias-brand-primary)',
+                      color: 'var(--dsw-alias-brand-primary)',
+                      fontWeight: 600,
+                    }
+                  : {}),
+                onClick: () => run('set_eagerness', { text: key }),
+              },
+              label,
+            )
+          }),
+        ),
+        h(
+          'div',
+          { key: 'eg-h', style: Object.assign({}, S.meta, { marginBottom: 6 }) },
+          '克制：AI 之间不主动接话；平衡：有话说就接；活跃：鼓励互动',
+        ),
+        h('div', {
           key: 'divider',
           style: { borderTop: '1px solid var(--dsw-alias-border-l1)', margin: '10px 0' },
         }),
@@ -1459,6 +1678,19 @@ window.__ModuleLoader__.load({
         },
         [
           h('span', { key: 'l', style: S.meta }, '我是'),
+          // 点自己的头像开「我的资料」（改头像/改昵称，一个弹层搞定）
+          group && meMember
+            ? h(
+                'span',
+                {
+                  key: 'me-av',
+                  title: '点这里改头像和昵称',
+                  style: { display: 'flex', cursor: 'pointer' },
+                  onClick: () => setProfileOpen(!profileOpen),
+                },
+                h(Avatar, { name: meName, url: avatarUrlFor(meMember), size: 22 }),
+              )
+            : null,
           h(
             'select',
             {

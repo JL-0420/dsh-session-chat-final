@@ -26,11 +26,32 @@ const DEFAULT_CONFIG = {
   scanHeadFrames: 40,
   ratePerMinute: 3,
   contextMessages: 2,
+  // 回复意愿档位：cautious（克制）/ balanced（平衡）/ active（活跃）
+  replyEagerness: 'balanced',
   stateDir: join(homedir(), '.dsh', 'session-chat'),
 }
 
+/** 三档回复意愿的提示语；改这里就能改投递给 AI 的措辞 */
+const EAGERNESS_NOTES = {
+  cautious: {
+    host: '主人发来的群聊消息。请正常回应，简短一两句就够。',
+    mention: '群里 @ 了你。请正常回应，简短一两句。',
+    peer: '另一个 AI 会话的群聊发言，知情即可，不要主动接话，避免无限来回。',
+  },
+  balanced: {
+    host: '主人发来的群聊消息。请正常回应，简短一两句就够。',
+    mention: '群里 @ 了你。请正常回应，简短一两句。',
+    peer: '另一个 AI 会话的群聊发言。你是这条的当事人、或者确实有想补充的，可以接一句；没啥可说就不用回。',
+  },
+  active: {
+    host: '主人发来的群聊消息。请积极回应，别敷衍。',
+    mention: '群里 @ 了你。请积极回应。',
+    peer: '另一个 AI 会话的群聊发言。你可以自行判断要不要接话——想聊就聊，但别为了接话而接话。',
+  },
+}
+
 // 版本自报：diag 会打出来，用来确认宿主到底加载的是哪一版
-const PLUGIN_VERSION = '1.6.0'
+const PLUGIN_VERSION = '1.10.2'
 
 /**
  * 读磁盘上 package.json 的版本。
@@ -202,8 +223,42 @@ export async function apply(ctx, config) {
   /** provider -> { at, models } 缓存，避免每次打开设置都去问端点 */
   const modelCache = new Map()
 
+  // 戳一戳冷却：同一对人 3 秒内只戳一次，防止面板连点刷屏
+  const pokeCooldown = new Map()
+  const POKE_COOLDOWN_MS = 3000
+
+  // 「正在输入」状态：只在面板里显示，不给任何会话投递
+  const typingState = new Map() // groupId -> Map(sessionId -> ts)
+  const TYPING_TTL_MS = 6000
+
+  function markTyping(groupId, sessionId) {
+    if (!groupId || !sessionId) return
+    if (!typingState.has(groupId)) typingState.set(groupId, new Map())
+    typingState.get(groupId).set(sessionId, Date.now())
+  }
+
+  function typingList(groupId, exceptId) {
+    const bucket = typingState.get(groupId)
+    if (!bucket) return []
+    const now = Date.now()
+    const rows = []
+    for (const [id, ts] of bucket) {
+      if (now - ts > TYPING_TTL_MS) {
+        bucket.delete(id)
+        continue
+      }
+      if (id === exceptId) continue
+      rows.push({ id, name: displayName(id), at: ts })
+    }
+    return rows
+  }
+
   // AI 路由：决定一条群聊消息该唤醒谁。mode='off' 表示全员推送。
   const router = { mode: 'off', provider: '', model: '' }
+
+  // 回复意愿档位，控制投递给 AI 的提示措辞
+  let eagerness = EAGERNESS_NOTES[cfg.replyEagerness] ? cfg.replyEagerness : 'balanced'
+  const eagernessNotes = () => EAGERNESS_NOTES[eagerness] || EAGERNESS_NOTES.balanced
 
   // ---- 持久化：群组、历史、昵称、限流、路由配置 --------------------------
   function loadState() {
@@ -217,7 +272,8 @@ export async function apply(ctx, config) {
         rate.paused = Boolean(data.rate.paused)
       }
       if (data.router) {
-        router.mode = data.router.mode === 'ai' ? 'ai' : 'off'
+        if (EAGERNESS_NOTES[data.eagerness]) eagerness = data.eagerness
+    router.mode = data.router.mode === 'ai' ? 'ai' : 'off'
         router.provider = String(data.router.provider || '')
         router.model = String(data.router.model || '')
       }
@@ -254,6 +310,7 @@ export async function apply(ctx, config) {
         savedAt: Date.now(),
         rate: { perMinute: rate.perMinute, paused: rate.paused },
         router: { mode: router.mode, provider: router.provider, model: router.model },
+        eagerness,
         identities: Object.fromEntries(identities),
         groups: [...groups.values()].map((g) => ({
           id: g.id,
@@ -592,7 +649,7 @@ export async function apply(ctx, config) {
     return new Set(liveSessions().map((agent) => agent.id))
   }
 
-  /** 按 id 精确 / 标题模糊 找会话，供 join_group 使用 */
+  /** 找会话：优先 id（精确或末尾片段），标题匹配只作兜底 —— 改名、重名都不影响 id 命中 */
   function resolveSessionRef(ref) {
     const wanted = String(ref ?? '').trim()
     if (!wanted) return undefined
@@ -650,6 +707,8 @@ export async function apply(ctx, config) {
         }
       }),
       messageCount: group.messages.length,
+      // 谁正在输入（只给面板看，不投递）
+      typing: typingList(group.id, null),
     }
   }
 
@@ -750,6 +809,29 @@ export async function apply(ctx, config) {
     return null
   }
 
+  /**
+   * 尝试「强行激活」一个不在线的会话（冷恢复）。
+   * 只依赖宿主暴露的 agents.resume；拿不到或失败就返回说明，不抛。
+   */
+  async function tryWake(sessionId) {
+    const agents = getService('agents')
+    if (!agents || typeof agents.resume !== 'function') {
+      return { ok: false, reason: '宿主没有 agents.resume' }
+    }
+    try {
+      const handle = await agents.resume({ sessionId })
+      // 不同版本可能返回 AgentHandle 或 Agent，都兼容一下
+      const live = handle && (handle.agent || handle)
+      if (live && live.followup) return { ok: true, agent: live }
+      // 即使返回值形状不认识，也再查一次注册表
+      const again = agents.get ? agents.get(sessionId) : undefined
+      if (again && again.followup) return { ok: true, agent: again }
+      return { ok: false, reason: '恢复后拿不到 agent' }
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error) }
+    }
+  }
+
   async function decideTargets(group, senderId, text) {
     if (router.mode !== 'ai' && router.mode !== 'auto') return null
     // 先算人数：只有一个可能的接收者时没必要花一次模型调用
@@ -847,10 +929,12 @@ export async function apply(ctx, config) {
               'transfer_owner',
               'set_identity',
               'send',
+              'poke',
               'history',
               'quota',
               'set_rate',
               'set_paused',
+              'set_eagerness',
               'router',
               'set_router',
               'diag',
@@ -861,13 +945,23 @@ export async function apply(ctx, config) {
           group: { type: 'string', description: '群组 id 或群组名' },
           session: {
             type: 'string',
-            description: '目标会话：完整 id、id 末尾片段、或标题关键字（join_group / kick_member 使用）',
+            description: '目标会话 **id**（最可靠，改名/重名都不受影响）。也接受 id 末尾片段或标题关键字作为兜底，但改名后可能失效',
           },
-          text: { type: 'string', description: '消息正文；set_paused 用 on/off；set_router 用 ai/off' },
+          text: {
+            type: 'string',
+            description:
+              '消息正文；set_paused 用 on/off；set_router 用 ai/auto/off；set_eagerness 用 cautious/balanced/active',
+          },
           name: { type: 'string', description: '群组名称或自己的昵称' },
           value: { type: 'number', description: 'set_rate 时的每分钟条数' },
           provider: { type: 'string', description: 'AI 路由使用的 provider（set_router 用）' },
           model: { type: 'string', description: 'AI 路由使用的模型 id（set_router 用）' },
+          force: { type: 'boolean', description: 'send 时强制唤醒全员，跳过 AI 路由判断' },
+          mentions: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'send 时要 @ 的成员 sessionId 列表（比在正文里写 @名字可靠，改名或重名都不会错）',
+          },
           include_subagent: { type: 'boolean', description: 'list_all_sessions 时是否包含 subagent 子会话' },
           include_archived: { type: 'boolean', description: 'list_all_sessions 时是否包含已归档会话' },
         },
@@ -1085,7 +1179,7 @@ export async function apply(ctx, config) {
             let target = me
             let targetLive = true
             if (rawRef && rawRef !== me) {
-              if (group.owner !== me) {
+              if (group.owner !== me && me !== HOST_ID) {
                 return { ok: false, text: '只有群主可以把别的会话拉进群。' }
               }
               const resolved = resolveSessionRef(rawRef)
@@ -1173,7 +1267,7 @@ export async function apply(ctx, config) {
           case 'transfer_owner': {
             const group = groupByKey(args?.group)
             if (!group) return { ok: false, text: '找不到这个群组。' }
-            if (group.owner !== me) return { ok: false, text: '只有当前群主可以转让群主。' }
+            if (group.owner !== me && me !== HOST_ID) return { ok: false, text: '只有当前群主可以转让群主。' }
             const rawRef = (args?.session ?? '').trim()
             if (!rawRef) return { ok: false, text: '需要提供 session（转给谁）。' }
             let target = group.members.has(rawRef) ? rawRef : undefined
@@ -1203,7 +1297,7 @@ export async function apply(ctx, config) {
           case 'kick_member': {
             const group = groupByKey(args?.group)
             if (!group) return { ok: false, text: '找不到这个群组。' }
-            if (group.owner !== me) return { ok: false, text: '只有群主可以踢人。' }
+            if (group.owner !== me && me !== HOST_ID) return { ok: false, text: '只有群主可以踢人。' }
             const rawRef = (args?.session ?? '').trim()
             if (!rawRef) return { ok: false, text: '需要提供 session（要踢的会话 id 或标题）。' }
             let target = group.members.has(rawRef) ? rawRef : undefined
@@ -1266,15 +1360,25 @@ export async function apply(ctx, config) {
 
             const senderName = displayName(me)
 
-            // @ 提及：从正文里解析 @名字，只认群内成员（长的名字优先，避免前缀撞车）
+            // @ 提及：优先用面板显式传来的成员 id（不依赖名字，改名/重名都不会错）；
+            // 没有 id 时才从正文里解析 @名字 作为兜底（AI 调用常常只给文本）。
             const mentions = []
-            const candidates = [...group.members]
-              .filter((id) => id !== me)
-              .map((id) => ({ id, name: displayName(id) }))
-              .filter((item) => item.name)
-              .sort((a, b) => b.name.length - a.name.length)
-            for (const item of candidates) {
-              if (text.includes('@' + item.name) && !mentions.includes(item.id)) mentions.push(item.id)
+            const explicit = Array.isArray(args?.mentions) ? args.mentions : []
+            for (const raw of explicit) {
+              const id = String(raw || '').trim()
+              if (!id || id === me) continue
+              if (!group.members.has(id)) continue
+              if (!mentions.includes(id)) mentions.push(id)
+            }
+            if (mentions.length === 0) {
+              const candidates = [...group.members]
+                .filter((id) => id !== me)
+                .map((id) => ({ id, name: displayName(id) }))
+                .filter((item) => item.name)
+                .sort((a, b) => b.name.length - a.name.length)
+              for (const item of candidates) {
+                if (text.includes('@' + item.name) && !mentions.includes(item.id)) mentions.push(item.id)
+              }
             }
 
             pushMessage(group, {
@@ -1291,24 +1395,27 @@ export async function apply(ctx, config) {
               return { ok: true, text: '消息已记录，但群里目前只有你一个人。', data: { delivered: 0 } }
             }
 
+            // 强制唤醒：跳过 AI 路由，直接全员。给「连路由都别信」的情况兜底。
+            const force = args?.force === true
+            // 保守策略：主人说的话一律不经过路由判断，直接全员送达。
+            // 模型再怎么判，也不能把宿主本人的话吞掉。
+            const byHost = me === HOST_ID
             // AI 路由：决定这次唤醒谁；@ 的人始终包含在内
-            const routed = await decideTargets(group, me, text)
-            const targets =
+            const routed = force || byHost ? null : await decideTargets(group, me, text)
+            let targets =
               routed === null
                 ? others
                 : [...new Set([...others.filter((id) => routed.includes(id)), ...mentions])]
 
-            saveState()
-
+            // 路由说「没人需要回」时不吞消息：仍然全员送达，
+            // 由每个 AI 自己决定要不要看群记录、要不要回。
+            let routeHint = ''
             if (targets.length === 0) {
-              return {
-                ok: true,
-                text:
-                  `消息已记录到「${group.name}」，AI 路由判断本轮不需要任何人回应` +
-                  `（成员 ${others.length} 人未被打扰）。`,
-                data: { delivered: 0, routedOut: others.length, mentions },
-              }
+              targets = others
+              routeHint = '（AI 路由觉得这条大概不用回应；你看情况决定要不要回，不回也没关系。）'
             }
+
+            saveState()
 
             // 上下文只带最近几条（每条截断）+ 完整记录文件路径。
             // 群聊越滚越长，全塞进消息里既费 token 又难读，想看全文让他们去读文件。
@@ -1324,8 +1431,9 @@ export async function apply(ctx, config) {
                     .join('\n') +
                   '\n'
                 : '') + (logFile ? '【完整记录】' + logFile + '\n\n' : '\n')
+            // 只有「路由确实筛掉了人」才提示；路由判空时已改全员送达，不该再报“只叫了几人”
             const routeNote =
-              routed !== null && routed.length < others.length
+              routed !== null && routed.length > 0 && targets.length < others.length
                 ? `（AI 路由：群里 ${others.length} 人，这次只叫了 ${targets.length} 人）\n\n`
                 : ''
 
@@ -1336,16 +1444,23 @@ export async function apply(ctx, config) {
             //   被 @ 的   → 鼓励回应
             //   其他 AI 的普通发言 → 知情即可，不主动接话（这才是防循环的关键）
             const fromHost = me === HOST_ID
+            const notes = eagernessNotes()
             const hostNote =
-              '（主人发来的群聊消息，请正常回应。群里说话简短点，一两句就够，别铺长文。' +
-              '回应发回群里用 session_chat 的 send，group 填群名或 id。）'
-            const peerNote =
-              '（另一个 AI 会话的群聊发言，知情即可，不要主动接话，避免会话之间无限来回。）'
+              '（' +
+              notes.host +
+              '群里说话简短点，别铺长文。回应发回群里用 session_chat 的 send，group 填群名或 id。）'
+            const peerNote = '（' + notes.peer + '）'
             const mentionNote =
-              '（群里 @ 了你，请正常回应，简短一两句。回应用 session_chat 的 send。）'
+              '（' + notes.mention + '回应用 session_chat 的 send。）'
+            // 这条 @ 了别人、但没 @ 我 → 我只是被抄送的旁观者，大幅降低回复意愿
+            const bystanderNote =
+              '（群里这条 @ 的是『' +
+              (mentionNames.join('、') || '别人') +
+              '』，不是 @ 你。你只是被抄送知情——除非确实有必要补充，否则不用回。）'
 
             const base =
               routeNote +
+              routeHint +
               historyText +
               `【群聊·${group.name}】${senderName}：${text}\n` +
               (fromHost ? hostNote : peerNote)
@@ -1357,12 +1472,20 @@ export async function apply(ctx, config) {
             for (const memberId of targets) {
               const isMentioned = mentions.includes(memberId)
               if (isMentioned) pinged.push(memberId)
+              // 有人被 @ 且不是我 → 旁观者提示
+              const isBystander = mentions.length > 0 && !isMentioned
               const payload = isMentioned
                 ? routeNote +
                   historyText +
                   `【群聊·${group.name}】【@你】${senderName}：${text}\n` +
                   mentionNote
-                : base
+                : isBystander
+                  ? routeNote +
+                    historyText +
+                    `【群聊·${group.name}】${senderName}：${text}\n` +
+                    (fromHost ? hostNote : '') +
+                    bystanderNote
+                  : base
               const result = deliver(memberId, payload)
               if (result === 'sent') {
                 sent += 1
@@ -1385,6 +1508,83 @@ export async function apply(ctx, config) {
                 (mentionNames.length ? `；已 @ ${mentionNames.join('、')}` : '') +
                 '。',
               data: { delivered: sent, queued: offline, failed, mentions, pinged },
+            }
+          }
+
+          case 'poke': {
+            // 戳一戳：单独叫醒某个会话一次，不带聊天记录，也不写群历史
+            const raw = String(args?.session || '').trim()
+            if (!raw) return { ok: false, text: '要戳谁？需要提供 session（会话 id 或名字）。' }
+            const pokeGroup = args?.group ? groupByKey(args.group) : undefined
+            // 先看是不是群成员：群成员哪怕离线也该能被识别出来
+            let targetId = ''
+            if (pokeGroup && pokeGroup.members.has(raw)) {
+              targetId = raw
+            } else {
+              const resolved = resolveSessionRef(raw)
+              if (resolved && resolved.ambiguous) {
+                const list = resolved.ambiguous
+                  .slice(0, 8)
+                  .map((row) => `· ${row.title || '(无标题)'} —— id: ${row.id}`)
+                  .join('\n')
+                return { ok: false, text: `「${raw}」匹配到多个会话：\n${list}` }
+              }
+              if (resolved) targetId = resolved.id
+            }
+            if (!targetId) return { ok: false, text: `找不到会话「${raw}」。` }
+            if (targetId === me) return { ok: false, text: '不能戳自己。' }
+
+            // 冷却：防止连点刷屏。同一对人 3 秒内只戳一次，重复的静默忽略。
+            const cooldownKey = me + '->' + targetId
+            const lastPoke = pokeCooldown.get(cooldownKey) || 0
+            const nowMs = Date.now()
+            if (nowMs - lastPoke < POKE_COOLDOWN_MS) {
+              const wait = Math.ceil((POKE_COOLDOWN_MS - (nowMs - lastPoke)) / 1000)
+              return {
+                ok: true,
+                text: `刚戳过 ${displayName(targetId)}，${wait} 秒后才能再戳。`,
+                data: { target: targetId, result: 'cooldown' },
+              }
+            }
+            pokeCooldown.set(cooldownKey, nowMs)
+
+            const quota = takeQuota(me)
+            if (!quota.allowed) {
+              if (quota.reason === 'paused') {
+                return { ok: false, text: '群聊投递已暂停，戳不出去。' }
+              }
+              return {
+                ok: false,
+                text: `已达频率上限：每分钟最多 ${rate.perMinute} 次，请等 ${Math.ceil(quota.retryAfterMs / 1000)} 秒。`,
+              }
+            }
+            const where = args?.group ? (groupByKey(args.group) || {}).name : ''
+            const time = new Date().toLocaleTimeString()
+            const payload =
+              `【${where ? '群聊·' + where : '群聊'}】${displayName(me)} 戳了你一下（${time}）\n` +
+              '（这是一次戳一戳，只是提醒。要不要回、回什么，你自己判断——想回就回，不想回忽略也行，不用带上下文。）'
+            let poked = deliver(targetId, payload)
+            let wakeNote = ''
+            if (poked === 'offline') {
+              // 离线就试着强行激活（冷恢复），成功后稍等再投一次
+              const wake = await tryWake(targetId)
+              if (wake.ok) {
+                await new Promise((resolve) => setTimeout(resolve, 600))
+                poked = deliver(targetId, payload)
+                wakeNote = poked === 'sent' ? '（已强行激活）' : '（已尝试激活，但仍未送达）'
+              } else if (wake.reason) {
+                wakeNote = `（未能激活：${wake.reason}）`
+              }
+            }
+            return {
+              ok: poked === 'sent',
+              text:
+                poked === 'sent'
+                  ? `已戳 ${displayName(targetId)} 一下${wakeNote}`
+                  : poked === 'offline'
+                    ? `${displayName(targetId)} 不在线，没戳到（戳不排队）${wakeNote}`
+                    : `戳 ${displayName(targetId)} 失败${wakeNote}`,
+              data: { target: targetId, result: poked },
             }
           }
 
@@ -1433,6 +1633,17 @@ export async function apply(ctx, config) {
               text: `已把频率限制设为每个会话每分钟 ${rate.perMinute} 条。`,
               data: { perMinute: rate.perMinute },
             }
+          }
+
+          case 'set_eagerness': {
+            const key = String((args && (args.text || args.value)) || '').trim()
+            if (!EAGERNESS_NOTES[key]) {
+              return { ok: false, text: '档位只能是 cautious（克制）/ balanced（平衡）/ active（活跃）。' }
+            }
+            eagerness = key
+            saveState()
+            const label = { cautious: '克制', balanced: '平衡', active: '活跃' }[key]
+            return { ok: true, text: `回复意愿已设为「${label}」`, data: { state: panelState(me) } }
           }
 
           case 'set_paused': {
@@ -1587,6 +1798,7 @@ export async function apply(ctx, config) {
       },
       rate: { perMinute: rate.perMinute, paused: rate.paused },
       router: { mode: router.mode, provider: router.provider, model: router.model },
+      eagerness,
       quota: senderId ? quotaView(senderId) : { used: 0, limit: rate.perMinute, resetInMs: 0 },
       sessions: [
         { id: HOST_ID, name: displayName(HOST_ID), cwd: '', host: true },
@@ -1714,6 +1926,16 @@ export async function apply(ctx, config) {
             }
 
             // ---- 独立头像库 ----------------------------------------------------
+            // 「正在输入」心跳：只更新面板状态，不投递任何会话
+            if (op === 'typing') {
+              const group = groupByKey(pick('group'))
+              if (group && senderId && group.members.has(senderId)) {
+                markTyping(group.id, senderId)
+              }
+              send(200, { ok: true })
+              return
+            }
+
             if (op === 'avatars') {
               const rows = listAvatars()
               send(200, { ok: true, dir: avatarDir, count: rows.length, avatars: rows })
@@ -1923,6 +2145,8 @@ export async function apply(ctx, config) {
               leave: 'leave_group',
               kick: 'kick_member',
               send: 'send',
+              poke: 'poke',
+              eagerness: 'set_eagerness',
               identity: 'set_identity',
               history: 'history',
               quota: 'quota',
@@ -1941,9 +2165,11 @@ export async function apply(ctx, config) {
               {
                 action,
                 group: pick('group'),
-                session: action === 'join_group' || action === 'kick_member' ? pick('target') : undefined,
+                session: action === 'join_group' || action === 'kick_member' || action === 'poke' ? pick('target') : undefined,
                 text: pick('text'),
                 name: pick('name'),
+                force: pick('force') === true || pick('force') === '1',
+                mentions: Array.isArray(body.mentions) ? body.mentions : undefined,
                 value: pick('value') === undefined ? undefined : Number(pick('value')),
               },
               { agent: { id: senderId } },
