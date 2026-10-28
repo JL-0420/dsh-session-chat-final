@@ -51,7 +51,7 @@ const EAGERNESS_NOTES = {
 }
 
 // 版本自报：diag 会打出来，用来确认宿主到底加载的是哪一版
-const PLUGIN_VERSION = '1.10.2'
+const PLUGIN_VERSION = '1.13.0'
 
 /**
  * 读磁盘上 package.json 的版本。
@@ -850,6 +850,21 @@ export async function apply(ctx, config) {
     }
 
     const roster = others.map((id) => `- id:${id} 名字:${displayName(id)}`).join('\n')
+    // 回复意愿档位影响路由的「推送意向」：克制档宁可不打扰
+    const stance =
+      eagerness === 'cautious'
+        ? [
+            '当前回复意愿档位：克制。',
+            '除非有人在明确提问、或者确实需要某个具体成员答复，否则一律输出 NONE。',
+            '宁可不推送，也不要打扰别人；闲聊、通知、事后补充一律 NONE。',
+          ].join('\n')
+        : eagerness === 'active'
+          ? ['当前回复意愿档位：活跃。', '只要这条消息与某人相关就列出他；拿不准时倾向于列出来。'].join('\n')
+          : [
+              '当前回复意愿档位：平衡。',
+              '只有当某个成员确实需要回应时才列出他；纯通知类可以输出 NONE。',
+            ].join('\n')
+
     const prompt = [
       `群组「${group.name}」里除发送者外的成员：`,
       roster,
@@ -859,6 +874,8 @@ export async function apply(ctx, config) {
       '"""',
       text.slice(0, 1500),
       '"""',
+      '',
+      stance,
       '',
       '判断这条消息需要哪些成员回应。只输出需要回应的成员 id（形如 id:xxx），一行一个；',
       '不需要任何人回应就只输出 NONE。不要解释。',
@@ -912,7 +929,7 @@ export async function apply(ctx, config) {
   const toolDef = {
       name: 'session_chat',
       description:
-        '跨会话群聊：列出会话（含休眠存档）、创建群组、拉人/踢人、设昵称、在群里发消息。只传文本，不共享任何工作区文件。',
+        '跨会话群聊：列出会话（含休眠存档）、创建群组、拉人/踢人、设置昵称、查看与更换头像、在群里发消息、戳一戳。只传文本，不共享任何工作区文件。',
       parameters: {
         type: 'object',
         properties: {
@@ -928,6 +945,8 @@ export async function apply(ctx, config) {
               'kick_member',
               'transfer_owner',
               'set_identity',
+              'list_avatars',
+              'set_avatar',
               'send',
               'poke',
               'history',
@@ -942,7 +961,10 @@ export async function apply(ctx, config) {
             ],
             description: '要执行的操作',
           },
-          group: { type: 'string', description: '群组 id 或群组名' },
+          group: {
+            type: 'string',
+            description: '群组名或群组 id（**不是模型名**，别和 provider/model 搞混）',
+          },
           session: {
             type: 'string',
             description: '目标会话 **id**（最可靠，改名/重名都不受影响）。也接受 id 末尾片段或标题关键字作为兜底，但改名后可能失效',
@@ -997,19 +1019,39 @@ export async function apply(ctx, config) {
               ok: true,
               text: [
                 '我是会话群聊工具 session_chat，可用 action：',
-                '· list_sessions —— 只看当前开着（活）的会话',
-                '· list_all_sessions —— 看全部会话，含已休眠的存档（带标题、工作区、最后活动）',
+                '',
+                '【会话 / 群组】',
+                '· list_sessions —— 只看当前开着（活）的会话（默认不含 subagent 子会话）',
+                '· list_all_sessions —— 全部会话含休眠存档；要子会话/已归档加 include_subagent / include_archived',
                 '· list_groups —— 看所有群组和成员',
                 '· create_group {name} —— 建群，自己自动成为群主',
-                '· join_group {group} —— 自己加入；群主可用 {session} 拉别人进来',
+                '· join_group {group, session?} —— 自己加入；群主/主人可用 session 拉别人',
                 '· leave_group {group} —— 退出群组',
-                '· kick_member {group, session} —— 群主踢人',
-                '· set_identity {name} —— 给自己起个昵称',
-                '· send {group, text} —— 在群里发言，消息会真的送到其他会话',
+                '· kick_member {group, session} —— 群主/主人踢人',
+                '· transfer_owner {group, session} —— 转让群主',
+                '',
+                '【发言】',
+                '· send {group, text, mentions?, force?} —— 在群里发言；mentions 传成员 id 最准；force=true 跳过 AI 路由全员送达',
+                '· poke {session, group?} —— 戳一戳：单独提醒某人，不带上下文、不写群记录、离线会自动尝试冷启动',
                 '· history {group} —— 看群聊记录',
                 '',
-                'session 参数三种写法都认：完整 id、id 末尾片段、或标题关键字。',
-                '注意：只互通对话，工作区文件互不共享；休眠会话能拉进群，但它不在线时消息只能排队。',
+                '【个人资料】',
+                '· set_identity {name} —— 改自己的群聊昵称',
+                '· list_avatars —— 列出头像库文件名 + 真实绝对路径（不知道头像放哪就先跑这个）',
+                '· set_avatar {name, group?} —— 换头像，name 必须是头像库里已有的文件名',
+                '',
+                '【配置】',
+                '· quota —— 看自己这个分钟的用量',
+                '· set_rate {value} —— 每分钟条数（1~120）',
+                '· set_paused {text=on|off} —— 暂停/恢复投递',
+                '· router —— 看 AI 路由现状',
+                '· set_router {text=off|auto|ai, provider?, model?} —— off 全员 / auto 跟随会议模型 / ai 固定模型',
+                '· set_eagerness {text=cautious|balanced|active} —— 回复意愿三档',
+                '· diag —— 版本对照、面板挂载、磁盘检查（排错用）',
+                '· help —— 就是这一页',
+                '',
+                '目标优先用 **session id**（完整或末尾片段），标题/群名只作兜底——改名后 id 仍然准。',
+                '群里只互通对话，工作区文件互不共享；离线会话消息会排队，等它上线补发。',
               ].join('\n'),
               data: {},
             }
@@ -1325,6 +1367,49 @@ export async function apply(ctx, config) {
             return { ok: true, text: `${displayName(target)} 已被移出「${group.name}」。` }
           }
 
+          case 'list_avatars': {
+            const rows = listAvatars()
+            if (!rows.length) {
+              return {
+                ok: true,
+                text:
+                  '头像库是空的。把图片放进这个目录即可：\n' +
+                  avatarDir +
+                  '\n放好后用 list_avatars 复查，再用 set_avatar 指定。',
+                data: { dir: avatarDir, avatars: [] },
+              }
+            }
+            return {
+              ok: true,
+              text:
+                `头像库（${avatarDir}）共 ${rows.length} 张：\n` +
+                rows.map((row, i) => `${i + 1}. ${row.name}`).join('\n') +
+                '\n\n换头像：session_chat(action="set_avatar", name="上面的文件名", group="群名或id")',
+              data: { dir: avatarDir, avatars: rows },
+            }
+          }
+
+          case 'set_avatar': {
+            const fileName = basename(String((args && args.name) || '').trim())
+            const ext = extname(fileName).toLowerCase()
+            if (!fileName || !AVATAR_EXT.has(ext)) {
+              return { ok: false, text: '要指定头像文件名（png / jpg / webp / gif）。先用 list_avatars 看看有哪些。' }
+            }
+            if (!existsSync(join(avatarDir, fileName))) {
+              return {
+                ok: false,
+                text: `头像库里没有「${fileName}」。目录：${avatarDir}（用 list_avatars 看现有列表）`,
+              }
+            }
+            const avGroup = groupByKey((args && args.group) || '') || (groups.size === 1 ? [...groups.values()][0] : undefined)
+            if (!avGroup) return { ok: false, text: '看不出要改哪个群的头像，请带 group。' }
+            if (!avGroup.members.has(me)) return { ok: false, text: '你不在这个群里。' }
+            if (!avGroup.avatars) avGroup.avatars = {}
+            avGroup.avatars[me] = fileName
+            saveState()
+            return { ok: true, text: `头像已换成「${fileName}」。`, data: { state: panelState(me) } }
+          }
+
           case 'set_identity': {
             const name = (args?.name ?? '').trim()
             if (!name) return { ok: false, text: '需要提供 name（昵称）。' }
@@ -1469,23 +1554,39 @@ export async function apply(ctx, config) {
             const offline = []
             const failed = []
             const pinged = []
+            // 路由参考：告诉接收者「模型认为这条是给谁的」，只作参考、不强制行为
+            const routeRefFor = (memberId) => {
+              if (routed === null || !routed.length) return ''
+              const names = routed.map((id) => displayName(id)).join('、')
+              if (routed.length === 1 && routed[0] === memberId) {
+                return '（路由参考：这条主要针对「你」）'
+              }
+              if (routed.includes(memberId)) {
+                return `（路由参考：这条主要针对「${names}」，其中有你）`
+              }
+              return `（路由参考：这条主要针对「${names}」，你只是知情）`
+            }
+
             for (const memberId of targets) {
               const isMentioned = mentions.includes(memberId)
               if (isMentioned) pinged.push(memberId)
               // 有人被 @ 且不是我 → 旁观者提示
               const isBystander = mentions.length > 0 && !isMentioned
+              const refLine = routeRefFor(memberId)
               const payload = isMentioned
                 ? routeNote +
                   historyText +
                   `【群聊·${group.name}】【@你】${senderName}：${text}\n` +
+                  (refLine ? refLine + '\n' : '') +
                   mentionNote
                 : isBystander
                   ? routeNote +
                     historyText +
                     `【群聊·${group.name}】${senderName}：${text}\n` +
+                    (refLine ? refLine + '\n' : '') +
                     (fromHost ? hostNote : '') +
                     bystanderNote
-                  : base
+                  : base + (refLine ? '\n' + refLine : '')
               const result = deliver(memberId, payload)
               if (result === 'sent') {
                 sent += 1
@@ -1746,6 +1847,7 @@ export async function apply(ctx, config) {
                       ? '跟随发消息的会话模型'
                       : '关闭（全员推送）'
                 }`,
+                `回复意愿：${eagerness}（cautious / balanced / active）`,
                 `活会话：${liveSessions().length}　群组：${groups.size}`,
                 `本会话已用：${quotaView(me).used}/${rate.perMinute}`,
                 // 三态说明直接印在这里：README 没人读，但 diag 每次排错都会看
@@ -2146,7 +2248,11 @@ export async function apply(ctx, config) {
               kick: 'kick_member',
               send: 'send',
               poke: 'poke',
+              // 面板用的是 action 原名，两条都认，避免再报 unknown op
               eagerness: 'set_eagerness',
+              set_eagerness: 'set_eagerness',
+              set_avatar: 'set_avatar',
+              list_avatars: 'list_avatars',
               identity: 'set_identity',
               history: 'history',
               quota: 'quota',
