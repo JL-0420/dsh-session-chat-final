@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-chat-final",
-  "version": "1.13.0",
+  "version": "1.15.0",
   "description": "DSH 会话群聊插件：让多个已开启的会话彼此交流，工作区互相隔离，可随时加入群组或踢出成员，带可视化面板与每分钟频率限制。",
   "keywords": [
     "dsh",

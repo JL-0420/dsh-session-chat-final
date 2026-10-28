@@ -25,6 +25,41 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 发一条系统通知；没授权就静默跳过 */
+    function notify(title, body) {
+      try {
+        if (typeof window === 'undefined' || !('Notification' in window)) return false
+        if (window.Notification.permission !== 'granted') return false
+        const n2 = new window.Notification(title, {
+          body: body || '',
+          tag: 'dsh-session-chat',
+          renotify: false,
+        })
+        n2.onclick = () => {
+          try {
+            window.focus()
+            n2.close()
+          } catch (e) {}
+        }
+        return true
+      } catch (e) {
+        return false
+      }
+    }
+
+    /** 申请通知权限（必须由用户点击触发） */
+    async function ensureNotifyPermission() {
+      try {
+        if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported'
+        if (window.Notification.permission === 'granted') return 'granted'
+        if (window.Notification.permission === 'denied') return 'denied'
+        const res = await window.Notification.requestPermission()
+        return res
+      } catch (e) {
+        return 'error'
+      }
+    }
+
     const S = {
       root: {
         display: 'flex',
@@ -337,6 +372,18 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = useState('')
       const [mentionOpen, setMentionOpen] = useState(false)
       const [profileOpen, setProfileOpen] = useState(false)
+      // 每个群「已读到的最新消息时间」，用来算未读角标
+      const [seen, setSeen] = useState(() => {
+        try {
+          return JSON.parse(window.localStorage.getItem('dsh-session-chat:seen') || '{}')
+        } catch {
+          return {}
+        }
+      })
+      // 新消息提示：走系统通知，页面内不弹浮层
+      const [notifyState, setNotifyState] = useState('default')
+      const mountedRef = useRef(false)
+      const lastUnreadRef = useRef(0)
       const [mentionPicks, setMentionPicks] = useState([])
       const [memes, setMemes] = useState([]) // 已弃用，保留占位避免旧引用报错
       const [avatarList, setAvatarList] = useState([])
@@ -598,6 +645,65 @@ window.__ModuleLoader__.load({
       // 当前用户在这个群里的成员对象（两处 head 都要用）
       const meMember = group ? group.members.find((m) => m.id === me) || null : null
 
+      /** 某个群有几条我没读过的新消息 */
+      const unreadOf = (g) => {
+        if (!g || !Array.isArray(g.messages)) return 0
+        const last = seen[g.id] || 0
+        return g.messages.filter((m) => (m.at || 0) > last && m.from !== me).length
+      }
+      const totalUnread = groups.reduce((sum, g) => sum + (g.id === activeGroup ? 0 : unreadOf(g)), 0)
+
+      // 未读数增加 → 弹一次浮层提示（首次加载不弹）
+      useEffect(() => {
+        if (!mountedRef.current) {
+          mountedRef.current = true
+          lastUnreadRef.current = totalUnread
+          return undefined
+        }
+        if (totalUnread > lastUnreadRef.current) {
+          const newest = groups
+            .filter((g) => g.id !== activeGroup && unreadOf(g) > 0)
+            .sort((a, b) => {
+              const la = a.messages && a.messages.length ? a.messages[a.messages.length - 1].at : 0
+              const lb = b.messages && b.messages.length ? b.messages[b.messages.length - 1].at : 0
+              return lb - la
+            })[0]
+          const name = newest ? newest.name : '群聊'
+          // 只发系统通知，页面内不弹浮层
+          const lastMsg =
+            newest && newest.messages && newest.messages.length
+              ? newest.messages[newest.messages.length - 1]
+              : null
+          notify(
+            '「' + name + '」有新消息',
+            totalUnread +
+              ' 条未读' +
+              (lastMsg ? ' · ' + (lastMsg.fromName || '') + '：' + String(lastMsg.text || '').slice(0, 60) : ''),
+          )
+          lastUnreadRef.current = totalUnread
+          return undefined
+        }
+        lastUnreadRef.current = totalUnread
+        return undefined
+      }, [totalUnread, groups, activeGroup])
+
+      // 切到某个群、且它有了新消息 → 标记已读
+      useEffect(() => {
+        if (!activeGroup) return undefined
+        const g = groups.find((x) => x.id === activeGroup)
+        if (!g || !Array.isArray(g.messages) || !g.messages.length) return undefined
+        const lastAt = g.messages[g.messages.length - 1].at || 0
+        if ((seen[activeGroup] || 0) >= lastAt) return undefined
+        const next = Object.assign({}, seen, { [activeGroup]: lastAt })
+        setSeen(next)
+        try {
+          window.localStorage.setItem('dsh-session-chat:seen', JSON.stringify(next))
+        } catch {
+          /* 忽略 */
+        }
+        return undefined
+      }, [activeGroup, groups, seen])
+
       /** 成员头像：手动指定的优先，其次按 seed 从库里取；都没有返回空（Avatar 退回首字） */
       const avatarUrlFor = (member) => {
         if (!member) return ''
@@ -713,6 +819,26 @@ window.__ModuleLoader__.load({
           },
           h('span', { key: 'd', style: S.dot(true) }),
           h('span', { key: 'n', style: S.itemName }, g.name),
+          (() => {
+            const n2 = g.id === activeGroup ? 0 : unreadOf(g)
+            return n2 > 0
+              ? h('span', {
+                  key: 'unread',
+                  style: {
+                    minWidth: 16,
+                    height: 16,
+                    padding: '0 4px',
+                    borderRadius: 8,
+                    background: 'var(--dsw-alias-state-error-primary)',
+                    color: '#fff',
+                    fontSize: 10,
+                    lineHeight: '16px',
+                    textAlign: 'center',
+                    fontWeight: 600,
+                  },
+                }, String(n2))
+              : null
+          })(),
           amMember(g)
             ? h('span', { key: 'm', style: S.badge('var(--dsw-alias-brand-primary)') }, '在群')
             : null,
@@ -1414,6 +1540,29 @@ window.__ModuleLoader__.load({
             onClick: () => run('set_paused', { paused: !rate.paused }),
           },
           rate.paused ? '已暂停 · 点此恢复' : '暂停投递',
+        ),
+        h(
+          'div',
+          { key: 'notify-r', style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 } },
+          [
+            h(
+              'button',
+              {
+                key: 'nb',
+                type: 'button',
+                style: notifyState === 'granted' ? S.btnPrimary : S.btn,
+                onClick: async () => {
+                  const res = await ensureNotifyPermission()
+                  setNotifyState(res)
+                  if (res === 'granted') setFlash('桌面通知已开启：切到别的窗口也能收到群消息提醒')
+                  else if (res === 'denied') setFlash('通知被拒绝了，需要在系统/浏览器设置里手动允许这个页面')
+                  else if (res === 'unsupported') setFlash('这个环境不支持系统通知')
+                },
+              },
+              notifyState === 'granted' ? '桌面通知：已开启' : '开启桌面通知',
+            ),
+            h('span', { key: 'nh', style: S.meta }, '开启后新消息会在系统里弹提醒，不用盯着面板'),
+          ],
         ),
         h('div', {
           key: 'divider-av',

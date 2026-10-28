@@ -51,7 +51,7 @@ const EAGERNESS_NOTES = {
 }
 
 // 版本自报：diag 会打出来，用来确认宿主到底加载的是哪一版
-const PLUGIN_VERSION = '1.13.0'
+const PLUGIN_VERSION = '1.15.0'
 
 /**
  * 读磁盘上 package.json 的版本。
